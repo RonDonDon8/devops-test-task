@@ -1,0 +1,125 @@
+---
+- name: Автоматизация установки Docker и запуска HTTP Checker
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    # Имя пользователя, которого добавим в группу docker
+    target_user: "{{ lookup('env', 'USER') | default('root', true) }}"
+    # Папка на сервере, куда скопируем файлы для сборки
+    work_dir: "/opt/http-checker"
+
+  tasks:
+    # ==========================================
+    # Установка Docker
+    # ==========================================
+    - name: Установка необходимых пакетов (зависимости)
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Создание директории для GPG ключей
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Скачивание официального GPG ключа Docker (Современный способ)
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Добавление репозитория Docker
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Установка Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: latest
+        update_cache: yes
+
+    - name: Добавление текущего пользователя в группу docker
+      user:
+        name: "{{ target_user }}"
+        groups: docker
+        append: yes
+
+    - name: Убеждаемся, что служба docker запущена и включена в автозагрузку
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Проверка успешности установки Docker
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Вывод версии Docker
+      debug:
+        msg: "Успешно установлен: {{ docker_version.stdout }}"
+
+    # ==========================================
+    # Подготовка и сборка образа
+    # ==========================================
+    - name: Создание рабочей директории
+      file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Копирование файлов проекта на целевой хост
+      copy:
+        src: "../section2/{{ item }}"
+        dest: "{{ work_dir }}/{{ item }}"
+      loop:
+        - Dockerfile
+        - script.py
+        - requirements.txt
+
+    - name: Сборка Docker-образа
+      command: docker build -t http-checker-image .
+      args:
+        chdir: "{{ work_dir }}"
+
+    # ==========================================
+    # Запуск и автоматическая проверка
+    # ==========================================
+    - name: Удаление старого контейнера (если он остался от прошлых запусков)
+      command: docker rm -f my-checker-run
+      ignore_errors: yes
+
+    - name: Запуск контейнера в фоновом режиме (detached)
+      command: docker run -d --name my-checker-run http-checker-image
+
+    - name: Ожидание завершения работы скрипта и получение кода выхода
+      # Команда wait блокирует выполнение, пока контейнер не остановится, и возвращает его exit code
+      command: docker wait my-checker-run
+      register: container_exit_code
+
+    - name: Проверка корректности выполнения (код завершения должен быть 0)
+      assert:
+        that: container_exit_code.stdout == "0"
+        fail_msg: "Скрипт завершился с ошибкой! Код: {{ container_exit_code.stdout }}"
+        success_msg: "Скрипт отработал корректно (код завершения 0)"
+
+    - name: Получение логов из контейнера
+      command: docker logs my-checker-run
+      register: container_logs
+
+    - name: ВЫВОД РЕЗУЛЬТАТОВ (docker logs) НА ЭКРАН
+      debug:
+        # Выводим как стандартный вывод (stdout), так и ошибки (stderr)
+        msg: "{{ container_logs.stdout_lines + container_logs.stderr_lines }}"
